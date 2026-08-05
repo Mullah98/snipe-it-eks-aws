@@ -1,0 +1,586 @@
+<?php
+
+namespace Tests\Feature\Importing\Api;
+
+use App\Models\Accessory;
+use App\Models\Actionlog;
+use App\Models\Import;
+use App\Models\User;
+use Illuminate\Foundation\Testing\WithFaker;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Str;
+use Illuminate\Testing\TestResponse;
+use PHPUnit\Framework\Attributes\Test;
+use Tests\Concerns\TestsPermissionsRequirement;
+use Tests\Support\Importing\AccessoriesImportFileBuilder as ImportFileBuilder;
+use Tests\Support\Importing\CleansUpImportFiles;
+
+class ImportAccessoriesTest extends ImportDataTestCase implements TestsPermissionsRequirement
+{
+    use CleansUpImportFiles;
+    use WithFaker;
+
+    protected function importFileResponse(array $parameters = []): TestResponse
+    {
+        if (! array_key_exists('import-type', $parameters)) {
+            $parameters['import-type'] = 'accessory';
+        }
+
+        return parent::importFileResponse($parameters);
+    }
+
+    #[Test]
+    public function test_requires_permission()
+    {
+        $this->actingAsForApi(User::factory()->create());
+
+        $this->importFileResponse(['import' => 44])->assertForbidden();
+    }
+
+    #[Test]
+    public function user_with_import_accessory_permission_can_import_accessories(): void
+    {
+        $this->actingAsForApi(User::factory()->canImport()->create());
+
+        $import = Import::factory()->accessory()->create();
+
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+    }
+
+    #[Test]
+    public function import_accessory(): void
+    {
+        $importFileBuilder = ImportFileBuilder::new();
+        $row = $importFileBuilder->firstRow();
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])
+            ->assertOk()
+            ->assertExactJson([
+                'payload' => ['tally' => ['created' => 1, 'updated' => 0, 'skipped' => 0, 'errored' => 0]],
+                'status' => 'success',
+                'messages' => [
+                    'redirect_url' => route('accessories.index'),
+                ],
+            ]);
+
+        $newAccessory = Accessory::query()
+            ->with(['location', 'category', 'manufacturer', 'supplier', 'company'])
+            ->where('name', $row['itemName'])
+            ->sole();
+
+        $activityLog = Actionlog::query()
+            ->where('item_type', Accessory::class)
+            ->where('item_id', $newAccessory->id)
+            ->sole();
+
+        $this->assertEquals('create', $activityLog->action_type);
+        $this->assertEquals('importer', $activityLog->action_source);
+        $this->assertEquals($newAccessory->company->id, $activityLog->company_id);
+
+        $this->assertEquals($row['itemName'], $newAccessory->name);
+        $this->assertEquals($row['quantity'], $newAccessory->qty);
+        $this->assertEquals($row['purchaseDate'], $newAccessory->purchase_date->toDateString());
+        $this->assertEquals($row['purchaseCost'], $newAccessory->purchase_cost);
+        $this->assertEquals($row['orderNumber'], $newAccessory->order_number);
+        $this->assertEquals($row['notes'], $newAccessory->notes);
+        $this->assertEquals($row['category'], $newAccessory->category->name);
+        $this->assertEquals('accessory', $newAccessory->category->category_type);
+        $this->assertEquals($row['manufacturerName'], $newAccessory->manufacturer->name);
+        $this->assertEquals($row['supplierName'], $newAccessory->supplier->name);
+        $this->assertEquals($row['location'], $newAccessory->location->name);
+        $this->assertEquals($row['companyName'], $newAccessory->company->name);
+        $this->assertEquals($row['modelNumber'], $newAccessory->model_number);
+        $this->assertFalse($newAccessory->requestable);
+        $this->assertNull($newAccessory->min_amt);
+        $this->assertNull($newAccessory->user_id);
+    }
+
+    #[Test]
+    public function when_import_file_contains_unknown_columns(): void
+    {
+        $row = ImportFileBuilder::new()->definition();
+        $row['unknownColumn'] = $this->faker->word;
+
+        $importFileBuilder = new ImportFileBuilder([$row]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+    }
+
+    #[Test]
+    public function will_format_date(): void
+    {
+        $importFileBuilder = ImportFileBuilder::new(['purchaseDate' => '2022/10/10']);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $accessory = Accessory::query()
+            ->where('name', $importFileBuilder->firstRow()['itemName'])
+            ->sole(['purchase_date']);
+
+        $this->assertEquals('2022-10-10', $accessory->purchase_date->toDateString());
+    }
+
+    #[Test]
+    public function will_not_create_new_category_when_category_exists(): void
+    {
+        $importFileBuilder = ImportFileBuilder::times(4)->replace(['category' => Str::random()]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessories = Accessory::query()
+            ->whereIn('name', $importFileBuilder->pluck('itemName'))
+            ->get();
+
+        $this->assertCount(1, $newAccessories->pluck('category_id')->unique()->all());
+    }
+
+    #[Test]
+    public function will_not_create_new_accessory_when_accessory_with_name_exists(): void
+    {
+        $accessory = Accessory::factory()->create(['name' => Str::random()]);
+        $importFileBuilder = ImportFileBuilder::times(2)->replace(['itemName' => $accessory->name]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $probablyNewAccessories = Accessory::query()
+            ->where('name', $importFileBuilder->pluck('itemName'))
+            ->get(['name']);
+
+        $this->assertCount(1, $probablyNewAccessories);
+        $this->assertEquals($accessory->name, $probablyNewAccessories->first()->name);
+    }
+
+    #[Test]
+    public function will_not_create_new_company_when_company_already_exists(): void
+    {
+        $importFileBuilder = ImportFileBuilder::times(4)->replace(['companyName' => Str::random()]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessories = Accessory::query()
+            ->where('name', $importFileBuilder->pluck('itemName'))
+            ->get(['company_id']);
+
+        $this->assertCount(1, $newAccessories->pluck('company_id')->unique()->all());
+    }
+
+    #[Test]
+    public function will_not_create_new_location_when_location_already_exists(): void
+    {
+        $importFileBuilder = ImportFileBuilder::times(4)->replace(['location' => Str::random()]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessories = Accessory::query()
+            ->where('name', $importFileBuilder->pluck('itemName'))
+            ->get(['location_id']);
+
+        $this->assertCount(1, $newAccessories->pluck('location_id')->unique()->all());
+    }
+
+    #[Test]
+    public function will_not_create_new_manufacturer_when_manufacturer_already_exists(): void
+    {
+        $importFileBuilder = ImportFileBuilder::times(4)->replace(['manufacturerName' => $this->faker->company]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessories = Accessory::query()
+            ->where('name', $importFileBuilder->pluck('itemName'))
+            ->get(['manufacturer_id']);
+
+        $this->assertCount(1, $newAccessories->pluck('manufacturer_id')->unique()->all());
+    }
+
+    #[Test]
+    public function will_not_create_new_supplier_when_supplier_already_exists(): void
+    {
+        $importFileBuilder = ImportFileBuilder::times(4)->replace(['supplierName' => $this->faker->company]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessories = Accessory::query()
+            ->where('name', $importFileBuilder->pluck('itemName'))
+            ->get(['supplier_id']);
+
+        $this->assertCount(1, $newAccessories->pluck('supplier_id')->unique()->all());
+    }
+
+    #[Test]
+    public function when_columns_are_missing_in_import_file(): void
+    {
+        $importFileBuilder = ImportFileBuilder::new()->forget(['minimumAmount', 'purchaseCost', 'purchaseDate']);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])->assertOk();
+
+        $newAccessory = Accessory::query()
+            ->where('name', $importFileBuilder->firstRow()['itemName'])
+            ->sole();
+
+        $this->assertNull($newAccessory->min_amt);
+        $this->assertNull($newAccessory->purchase_date);
+        $this->assertNull($newAccessory->purchase_cost);
+    }
+
+    #[Test]
+    public function when_required_columns_are_missing_in_import_file(): void
+    {
+        $importFileBuilder = ImportFileBuilder::new()->forget(['itemName', 'category']);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])
+            ->assertInternalServerError()
+            ->assertExactJson([
+                'status' => 'import-errors',
+                'payload' => ['tally' => ['created' => 0, 'updated' => 0, 'skipped' => 0, 'errored' => 1]],
+                'messages' => [
+                    '' => [
+                        'Accessory' => [
+                            'category_id' => ['The category id field is required.'],
+                            'name' => ['The name field is required.'],
+                        ],
+                    ],
+                ],
+            ]);
+    }
+
+    #[Test]
+    public function update_accessory_from_import(): void
+    {
+        $accessory = Accessory::factory()->create(['name' => Str::random()])->refresh();
+        $importFileBuilder = ImportFileBuilder::new(['itemName' => $accessory->name]);
+        $row = $importFileBuilder->firstRow();
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id, 'import-update' => true])->assertOk();
+
+        $updatedAccessory = Accessory::query()->find($accessory->id);
+        $updatedAttributes = [
+            'name', 'company_id', 'qty', 'purchase_date', 'purchase_cost',
+            'order_number', 'notes', 'category_id', 'manufacturer_id', 'supplier_id',
+            'location_id', 'model_number', 'updated_at',
+        ];
+
+        $this->assertEquals($row['itemName'], $updatedAccessory->name);
+        $this->assertEquals($row['companyName'], $updatedAccessory->company->name);
+        $this->assertEquals($row['quantity'], $updatedAccessory->qty);
+        $this->assertEquals($row['purchaseDate'], $updatedAccessory->purchase_date->toDateString());
+        $this->assertEquals($row['purchaseCost'], $updatedAccessory->purchase_cost);
+        $this->assertEquals($row['orderNumber'], $updatedAccessory->order_number);
+        $this->assertEquals($row['notes'], $updatedAccessory->notes);
+        $this->assertEquals($row['category'], $updatedAccessory->category->name);
+        $this->assertEquals('accessory', $updatedAccessory->category->category_type);
+        $this->assertEquals($row['manufacturerName'], $updatedAccessory->manufacturer->name);
+        $this->assertEquals($row['supplierName'], $updatedAccessory->supplier->name);
+        $this->assertEquals($row['location'], $updatedAccessory->location->name);
+        $this->assertEquals($row['modelNumber'], $updatedAccessory->model_number);
+
+        $this->assertEquals(
+            Arr::except($accessory->attributesToArray(), $updatedAttributes),
+            Arr::except($updatedAccessory->attributesToArray(), $updatedAttributes),
+        );
+    }
+
+    #[Test]
+    public function update_mode_logs_accessory_update_in_actionlog(): void
+    {
+        $this->actingAsForApi(User::factory()->superuser()->create());
+
+        $initialFile = ImportFileBuilder::new();
+        $initialRow = $initialFile->firstRow();
+
+        $initialImport = Import::factory()->accessory()->create([
+            'file_path' => $initialFile->saveToImportsDirectory(),
+        ]);
+
+        $this->importFileResponse(['import' => $initialImport->id])->assertOk();
+
+        $accessory = Accessory::query()->where('name', $initialRow['itemName'])->sole();
+
+        $updatedRow = array_merge($initialRow, [
+            'orderNumber' => (string) $initialRow['orderNumber'].'-UPD',
+        ]);
+
+        $updateFile = new ImportFileBuilder([$updatedRow]);
+        $updateImport = Import::factory()->accessory()->create([
+            'file_path' => $updateFile->saveToImportsDirectory(),
+        ]);
+
+        $this->importFileResponse([
+            'import' => $updateImport->id,
+            'import-update' => true,
+        ])->assertOk();
+
+        $accessory->refresh();
+        $this->assertEquals($updatedRow['orderNumber'], $accessory->order_number);
+
+        $updateLog = Actionlog::query()
+            ->where('item_type', Accessory::class)
+            ->where('item_id', $accessory->id)
+            ->where('action_type', 'update')
+            ->latest('id')
+            ->first();
+
+        $this->assertNotNull($updateLog, 'Expected an update action log entry after accessory importer update mode.');
+    }
+
+    #[Test]
+    public function update_mode_clears_field_when_csv_column_is_present_but_empty(): void
+    {
+        $this->actingAsForApi(User::factory()->superuser()->create());
+
+        $accessory = Accessory::factory()->create([
+            'notes' => 'Some pre-existing notes',
+            'purchase_date' => '2022-01-01',
+        ])->refresh();
+
+        $this->assertNotNull($accessory->purchase_date);
+        $this->assertNotEmpty($accessory->notes);
+
+        $row = ImportFileBuilder::new()->definition();
+        $row['itemName'] = $accessory->name;
+        $row['notes'] = '';
+        $row['purchaseDate'] = '';
+
+        $importFileBuilder = new ImportFileBuilder([$row]);
+        $import = Import::factory()->accessory()->create([
+            'file_path' => $importFileBuilder->saveToImportsDirectory(),
+        ]);
+
+        $this->importFileResponse([
+            'import' => $import->id,
+            'import-update' => true,
+        ])->assertOk();
+
+        $accessory->refresh();
+        $this->assertNull($accessory->notes);
+        $this->assertNull($accessory->purchase_date);
+    }
+
+    #[Test]
+    public function update_mode_preserves_fields_when_csv_column_is_absent(): void
+    {
+        $this->actingAsForApi(User::factory()->superuser()->create());
+
+        $accessory = Accessory::factory()->create([
+            'notes' => 'Do not lose this',
+            'purchase_date' => '2022-01-01',
+        ])->refresh();
+
+        $originalNotes = $accessory->notes;
+        $originalPurchaseDate = $accessory->purchase_date?->toDateString();
+
+        // Import a CSV that only has the identity field (name) plus one
+        // updated column. All other Accessory fields are absent from the
+        // CSV, so their DB values must be preserved on update.
+        $partialFile = new ImportFileBuilder([[
+            'itemName' => $accessory->name,
+            'orderNumber' => 'UPDATED-ORDER',
+        ]]);
+        $partialImport = Import::factory()->accessory()->create([
+            'file_path' => $partialFile->saveToImportsDirectory(),
+        ]);
+
+        $this->importFileResponse([
+            'import' => $partialImport->id,
+            'import-update' => true,
+        ])->assertOk();
+
+        $accessory->refresh();
+        $this->assertEquals('UPDATED-ORDER', $accessory->order_number);
+        $this->assertEquals($originalNotes, $accessory->notes);
+        $this->assertEquals($originalPurchaseDate, $accessory->purchase_date?->toDateString());
+    }
+
+    #[Test]
+    public function when_import_file_contains_empty_values(): void
+    {
+        $accessory = Accessory::factory()->create(['name' => Str::random()]);
+        $accessory->refresh();
+
+        $importFileBuilder = ImportFileBuilder::new([
+            'companyName' => ' ',
+            'purchaseDate' => '  ',
+            'purchaseCost' => '',
+            'location' => '',
+            'orderNumber' => '',
+            'category' => '',
+            'quantity' => '',
+            'manufacturerName' => '',
+            'supplierName' => '',
+            'notes' => '',
+            'requestAble' => '',
+            'minimumAmount' => '',
+            'modelNumber' => '',
+        ]);
+
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse(['import' => $import->id])
+            ->assertInternalServerError()
+            ->assertExactJson([
+                'status' => 'import-errors',
+                'payload' => ['tally' => ['created' => 0, 'updated' => 0, 'skipped' => 0, 'errored' => 1]],
+                'messages' => [
+                    $importFileBuilder->firstRow()['itemName'] => [
+                        'Accessory' => [
+                            'category_id' => ['The category id field is required.'],
+                        ],
+                    ],
+                ],
+            ]);
+
+        $importFileBuilder->replace(['itemName' => $accessory->name]);
+
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->importFileResponse(['import' => $import->id, 'import-update' => true])->assertOk();
+
+        $updatedAccessory = clone $accessory;
+        $updatedAccessory->refresh();
+
+        $this->assertEquals($accessory->toArray(), $updatedAccessory->toArray());
+    }
+
+    #[Test]
+    public function custom_column_mapping(): void
+    {
+        $faker = ImportFileBuilder::new()->definition();
+        $row = [
+            'itemName' => $faker['modelNumber'],
+            'purchaseDate' => $faker['notes'],
+            'purchaseCost' => $faker['location'],
+            'location' => $faker['purchaseCost'],
+            'companyName' => $faker['orderNumber'],
+            'orderNumber' => $faker['companyName'],
+            'category' => $faker['manufacturerName'],
+            'manufacturerName' => $faker['category'],
+            'notes' => $faker['purchaseDate'],
+            'minimumAmount' => $faker['supplierName'],
+            'modelNumber' => $faker['itemName'],
+            'quantity' => $faker['quantity'],
+        ];
+
+        $importFileBuilder = new ImportFileBuilder([$row]);
+        $import = Import::factory()->accessory()->create(['file_path' => $importFileBuilder->saveToImportsDirectory()]);
+
+        $this->actingAsForApi(User::factory()->superuser()->create());
+        $this->importFileResponse([
+            'import' => $import->id,
+            'column-mappings' => [
+                'Item Name' => 'model_number',
+                'Purchase Date' => 'notes',
+                'Purchase Cost' => 'location',
+                'Location' => 'purchase_cost',
+                'Company' => 'order_number',
+                'Order Number' => 'company',
+                'Category' => 'manufacturer',
+                'Manufacturer' => 'category',
+                'Supplier' => 'min_amt',
+                'Notes' => 'purchase_date',
+                'Min QTY' => 'supplier',
+                'Model Number' => 'item_name',
+                'Quantity' => 'quantity',
+            ],
+        ])->assertOk();
+
+        $newAccessory = Accessory::query()
+            ->with(['location', 'category', 'manufacturer', 'supplier'])
+            ->where('name', $row['modelNumber'])
+            ->sole();
+
+        $this->assertEquals($row['modelNumber'], $newAccessory->name);
+        $this->assertEquals($row['itemName'], $newAccessory->model_number);
+        $this->assertEquals($row['quantity'], $newAccessory->qty);
+        $this->assertEquals($row['notes'], $newAccessory->purchase_date->toDateString());
+        $this->assertEquals($row['location'], $newAccessory->purchase_cost);
+        $this->assertEquals($row['companyName'], $newAccessory->order_number);
+        $this->assertEquals($row['purchaseDate'], $newAccessory->notes);
+        $this->assertEquals($row['manufacturerName'], $newAccessory->category->name);
+        $this->assertEquals($row['category'], $newAccessory->manufacturer->name);
+        $this->assertEquals($row['purchaseCost'], $newAccessory->location->name);
+    }
+
+    #[Test]
+    public function accessory_import_checks_out_to_user_when_username_matches(): void
+    {
+        $actor = User::factory()->superuser()->create();
+        $target = User::factory()->create(['username' => 'accessorytarget']);
+
+        // Hand-crafted CSV: needs the checkout columns
+        // (checkout_class + username) alongside the standard accessory
+        // columns, which the AccessoriesImportFileBuilder doesn't include.
+        $csv = "Item Name,Category,Quantity,Company,Checkout Type,Username\n"
+            .'CSV-Checked-Accessory,Cables,5,CSVCo,user,'.$target->username."\n";
+        $filename = 'accessory-checkout-'.uniqid().'.csv';
+        file_put_contents(config('app.private_uploads').'/imports/'.$filename, $csv);
+
+        try {
+            $import = Import::factory()->accessory()->create(['file_path' => $filename]);
+
+            $this->actingAsForApi($actor);
+            $this->importFileResponse(['import' => $import->id])->assertOk();
+
+            $accessory = Accessory::query()->where('name', 'CSV-Checked-Accessory')->sole();
+            $this->assertEquals(5, $accessory->qty);
+
+            $this->assertDatabaseHas('accessories_checkout', [
+                'accessory_id' => $accessory->id,
+                'assigned_to' => $target->id,
+                'assigned_type' => User::class,
+            ]);
+        } finally {
+            @unlink(config('app.private_uploads').'/imports/'.$filename);
+        }
+    }
+
+    #[Test]
+    public function accessory_import_without_checkout_columns_does_not_create_checkout(): void
+    {
+        $actor = User::factory()->superuser()->create();
+
+        $csv = "Item Name,Category,Quantity,Company\n"
+            ."CSV-Uncheckedout-Accessory,Cables,3,CSVCo\n";
+        $filename = 'accessory-nocheckout-'.uniqid().'.csv';
+        file_put_contents(config('app.private_uploads').'/imports/'.$filename, $csv);
+
+        try {
+            $import = Import::factory()->accessory()->create(['file_path' => $filename]);
+
+            $this->actingAsForApi($actor);
+            $this->importFileResponse(['import' => $import->id])->assertOk();
+
+            $accessory = Accessory::query()->where('name', 'CSV-Uncheckedout-Accessory')->sole();
+            $this->assertDatabaseMissing('accessories_checkout', [
+                'accessory_id' => $accessory->id,
+            ]);
+        } finally {
+            @unlink(config('app.private_uploads').'/imports/'.$filename);
+        }
+    }
+}
